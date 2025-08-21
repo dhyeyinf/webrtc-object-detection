@@ -1,153 +1,97 @@
 #!/bin/bash
 
-# WebRTC Object Detection Start Script
-set -e
-
-# Default configuration
+# Configuration
 MODE=${MODE:-"server"}
 PORT=${PORT:-3000}
-USE_NGROK=false
-NGROK_URL=""
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --mode)
-      MODE="$2"
-      shift 2
-      ;;
-    --port)
-      PORT="$2"
-      shift 2
-      ;;
-    --ngrok)
-      USE_NGROK=true
-      shift
-      ;;
-    --wasm)
-      MODE="wasm"
-      shift
-      ;;
-    --server)
-      MODE="server"
-      shift
-      ;;
-    -h|--help)
-      echo "Usage: $0 [options]"
-      echo "Options:"
-      echo "  --mode <server|wasm>    Set inference mode (default: server)"
-      echo "  --port <port>           Set port number (default: 3000)"
-      echo "  --ngrok                 Use ngrok for public access"
-      echo "  --wasm                  Use WASM mode (client-side inference)"
-      echo "  --server                Use server mode (server-side inference)"
-      echo "  -h, --help              Show this help message"
-      exit 0
-      ;;
-    *)
-      echo "Unknown option $1"
-      exit 1
-      ;;
-  esac
-done
+HTTPS_PORT=${HTTPS_PORT:-8443}
 
 echo "🚀 Starting WebRTC Object Detection Demo"
 echo "Mode: $MODE"
 echo "Port: $PORT"
 
-# Check if Node.js is installed
-if ! command -v node &> /dev/null; then
-    echo "❌ Node.js is not installed. Please install Node.js 16+ and try again."
-    exit 1
-fi
+# Create models directory
+mkdir -p models
 
-# Check if npm is installed
-if ! command -v npm &> /dev/null; then
-    echo "❌ npm is not installed. Please install npm and try again."
-    exit 1
-fi
-
-# Install dependencies if node_modules doesn't exist
-if [ ! -d "node_modules" ]; then
-    echo "📦 Installing dependencies..."
-    npm install
-fi
-
-# Download model if it doesn't exist
-if [ ! -f "models/yolov5n.onnx" ]; then
-    echo "📥 Downloading YOLOv5 model..."
-    mkdir -p models
-    if [ -f "download_model.js" ]; then
-        node download_model.js
-    else
-        echo "⚠️  download_model.js not found. Please ensure the model is available."
-    fi
-fi
-
-# Start ngrok if requested
-if [ "$USE_NGROK" = true ]; then
-    echo "🌐 Starting ngrok..."
+# Check if we have the YOLOv5s model (14MB), if not download it
+if [ ! -f "models/yolov5s.onnx" ]; then
+    echo "📥 Downloading YOLOv5s model..."
+    echo "📥 Downloading YOLOv5s ONNX model (14MB)..."
+    echo "📍 From: https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx"
+    echo "💾 To: $(pwd)/models/yolov5s.onnx"
     
-    # Check if ngrok is installed
-    if ! command -v ngrok &> /dev/null; then
-        echo "❌ ngrok is not installed. Please install ngrok or run without --ngrok flag."
-        echo "   Visit: https://ngrok.com/download"
+    # Try wget first, then curl
+    if command -v wget >/dev/null 2>&1; then
+        if wget --progress=bar:force:noscroll -O models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx" 2>&1 | \
+           while IFS= read -r line; do
+               if [[ $line =~ ([0-9]+)%.*\[.*\].*([0-9]+[KMG]?).*([0-9]+[KMG]?) ]]; then
+                   printf "\r⏳ Progress: %s (%s / %s)" "${BASH_REMATCH[1]}%" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+               fi
+           done; then
+            echo ""
+            echo "✅ Model downloaded successfully!"
+        else
+            echo "❌ wget failed, trying curl..."
+            curl -L --progress-bar -o models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx"
+        fi
+    else
+        curl -L --progress-bar -o models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx"
+    fi
+    
+    # Check download success
+    if [ -f "models/yolov5s.onnx" ]; then
+        size=$(stat -f%z models/yolov5s.onnx 2>/dev/null || stat -c%s models/yolov5s.onnx 2>/dev/null || echo "unknown")
+        size_mb=$((size / 1024 / 1024))
+        echo "📊 File size: ${size_mb}MB"
+        
+        if [ $size_mb -gt 10 ]; then
+            echo "✅ Model size looks correct!"
+        else
+            echo "⚠️ Warning: Model size seems small (${size_mb}MB), expected ~14MB"
+        fi
+    else
+        echo "❌ Failed to download model"
         exit 1
     fi
-    
-    # Kill any existing ngrok processes
-    pkill ngrok || true
-    sleep 2
-    
-    # Start ngrok in background
-    ngrok http $PORT --log=stdout > ngrok.log 2>&1 &
-    NGROK_PID=$!
-    
-    # Wait for ngrok to start and get URL
-    echo "⏳ Waiting for ngrok to initialize..."
-    sleep 5
-    
-    # Extract ngrok URL
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | grep -o '"public_url":"[^"]*https[^"]*"' | grep -o 'https[^"]*' | head -1)
-    
-    if [ -n "$NGROK_URL" ]; then
-        echo "✅ ngrok started successfully"
-        echo "📱 Public URL: $NGROK_URL"
-        export NGROK_URL="$NGROK_URL"
-    else
-        echo "❌ Failed to get ngrok URL. Check ngrok.log for details."
-        kill $NGROK_PID || true
-        exit 1
-    fi
-    
-    # Cleanup function
-    cleanup() {
-        echo "🧹 Cleaning up..."
-        kill $NGROK_PID || true
-        pkill ngrok || true
-        exit
-    }
-    
-    # Set trap to cleanup on script exit
-    trap cleanup EXIT INT TERM
+else
+    size=$(stat -f%z models/yolov5s.onnx 2>/dev/null || stat -c%s models/yolov5s.onnx 2>/dev/null || echo "unknown")
+    size_mb=$((size / 1024 / 1024))
+    echo "✅ YOLOv5s model found (${size_mb}MB)"
 fi
 
-# Set environment variables
-export MODE="$MODE"
-export PORT="$PORT"
+# Remove old yolov5n model if it exists to avoid confusion
+if [ -f "models/yolov5n.onnx" ]; then
+    echo "🗑️ Removing old YOLOv5n model..."
+    rm models/yolov5n.onnx
+fi
 
-# Start the server
 echo "🎬 Starting server..."
 echo "📖 Open http://localhost:$PORT in your browser"
-if [ -n "$NGROK_URL" ]; then
-    echo "📱 Or scan QR code with your phone to connect"
-fi
 echo "🛑 Press Ctrl+C to stop"
 
-# Start server with appropriate mode
 if [ "$MODE" = "wasm" ]; then
-    echo "🧠 Running in WASM mode (client-side inference)"
+    echo "🌐 Running in WASM mode (client-side inference)"
 else
     echo "🖥️  Running in server mode (server-side inference)"
 fi
 
-node server.js
+# Generate SSL certificates if they don't exist
+if [ ! -f "key.pem" ] || [ ! -f "cert.pem" ]; then
+    echo "🔐 Generating SSL certificates for HTTPS..."
+    openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" >/dev/null 2>&1
+fi
+
+echo "🔒 Starting HTTPS server for WebRTC compatibility..."
+
+# Set environment variables and start server
+export MODE=$MODE
+export PORT=$PORT
+export HTTPS_PORT=$HTTPS_PORT
+
+# Start with node
+if command -v node >/dev/null 2>&1; then
+    node server.js
+else
+    echo "❌ Node.js not found. Please install Node.js first."
+    exit 1
+fi

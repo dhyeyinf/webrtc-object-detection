@@ -8,7 +8,7 @@ const io = require('socket.io');
 const QRCode = require('qrcode');
 const ort = require('onnxruntime-node');
 const sharp = require('sharp');
-const jimp = require('jimp'); 
+const Jimp = require('jimp');
 
 // Configuration
 const MODE = process.env.MODE || 'server';
@@ -100,69 +100,177 @@ async function processImage(imageData, width, height) {
     console.log('🔧 Processing image with YOLOv5s...');
     
     if (typeof imageData === 'string') {
-      // Handle base64 string
       const base64Data = imageData.split(',')[1] || imageData;
       const buffer = Buffer.from(base64Data, 'base64');
       
       console.log('📊 Input buffer size:', buffer.length);
       
-      // Process with Sharp
-      const { data, info } = await sharp(buffer)
-        .resize(640, 640)
-        .removeAlpha()
-        .raw()
-        .toBuffer({ resolveWithObject: true });
-      
-      console.log('📊 Sharp processed:', info);
-      console.log('📊 Raw data length:', data.length);
-      
-      // Check for actual pixel data
-      const samplePixels = Array.from(data.slice(0, 20));
-      console.log('📊 Sample pixel values:', samplePixels);
-      
-      const nonZeroCount = data.filter(val => val > 0).length;
-      console.log('📊 Non-zero pixels:', nonZeroCount);
-      
-      if (nonZeroCount === 0) {
-        console.log('⚠️ All pixels are zero, trying Jimp fallback...');
+      try {
+        // Process with Sharp
+        const { data, info } = await sharp(buffer)
+          .resize(640, 640)
+          .removeAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
         
-        // Fallback to Jimp
-        const image = await jimp.read(buffer);
-        image.resize(640, 640);
-        const jimpData = image.bitmap.data;
+        console.log('📊 Sharp processed:', info);
         
-        // Convert RGBA to RGB Float32Array
-        const processedData = new Float32Array(640 * 640 * 3);
-        for (let i = 0, j = 0; i < jimpData.length; i += 4) {
-          processedData[j++] = jimpData[i] / 255.0;     // R
-          processedData[j++] = jimpData[i + 1] / 255.0; // G
-          processedData[j++] = jimpData[i + 2] / 255.0; // B
+        if (data.length === 0) {
+          console.log('❌ Sharp produced empty data');
+          return [];
         }
         
-        console.log('📊 Jimp processed sample:', Array.from(processedData.slice(0, 10)));
+        // Convert RGB data to CHW format (Channels, Height, Width) and normalize
+        const processedData = new Float32Array(640 * 640 * 3);
         
-        // Create tensor with float32 (YOLOv5s should support this)
-        const input = new ort.Tensor('float32', processedData, [1, 3, 640, 640]);
-        const results = await session.run({ images: input });
-        console.log('✅ Inference successful with Jimp data');
+        // YOLOv5 expects CHW format: [R_channel, G_channel, B_channel]
+        // Sharp gives us HWC format: [R,G,B,R,G,B,R,G,B,...]
         
-        return parseDetections(results.output0.data, width, height);
+        for (let c = 0; c < 3; c++) { // For each channel (R, G, B)
+          for (let h = 0; h < 640; h++) { // For each row
+            for (let w = 0; w < 640; w++) { // For each column
+              const hwcIndex = (h * 640 + w) * 3 + c; // HWC format index
+              const chwIndex = c * 640 * 640 + h * 640 + w; // CHW format index
+              processedData[chwIndex] = data[hwcIndex] / 255.0; // Normalize to [0,1]
+            }
+          }
+        }
+        
+        console.log('📊 Converted to CHW format');
+        console.log('📊 Sample normalized values:', Array.from(processedData.slice(0, 10)));
+        
+        // Create tensor with correct input name for YOLOv5s
+        // Try different possible input names
+        const possibleInputNames = ['images', 'input', 'input.1', 'data'];
+        let input;
+        let inputName;
+        
+        // Get the actual input name from the session
+        const inputNames = session.inputNames;
+        console.log('📊 Model input names:', inputNames);
+        
+        if (inputNames && inputNames.length > 0) {
+          inputName = inputNames[0];
+        } else {
+          inputName = 'images'; // Default fallback
+        }
+        
+        console.log('📊 Using input name:', inputName);
+        
+        // Create tensor
+        input = new ort.Tensor('float32', processedData, [1, 3, 640, 640]);
+        
+        console.log('✅ Tensor created, running inference...');
+        
+        // Run inference
+        const feeds = {};
+        feeds[inputName] = input;
+        const results = await session.run(feeds);
+        
+        console.log('✅ Inference successful');
+        console.log('📊 Output keys:', Object.keys(results));
+        
+        // Get the output (try different possible output names)
+        let output;
+        const possibleOutputNames = ['output', 'output0', 'output.0', 'predictions'];
+        
+        for (const name of possibleOutputNames) {
+          if (results[name]) {
+            output = results[name];
+            console.log('📊 Found output:', name);
+            break;
+          }
+        }
+        
+        if (!output) {
+          // Take the first available output
+          const outputKeys = Object.keys(results);
+          if (outputKeys.length > 0) {
+            output = results[outputKeys[0]];
+            console.log('📊 Using first output:', outputKeys[0]);
+          } else {
+            console.log('❌ No output found');
+            return [];
+          }
+        }
+        
+        return parseDetections(output.data, width, height);
+        
+      } catch (sharpError) {
+        console.log('❌ Sharp failed:', sharpError.message);
+        console.log('🔄 Trying Jimp fallback...');
+        
+        try {
+          const image = await Jimp.read(buffer);
+          console.log('📊 Jimp loaded image:', image.bitmap.width, 'x', image.bitmap.height);
+          
+          image.resize(640, 640);
+          const jimpData = image.bitmap.data; // RGBA format
+          
+          console.log('📊 Jimp data length:', jimpData.length);
+          
+          if (jimpData.length === 0) {
+            console.log('❌ Jimp produced empty data');
+            return [];
+          }
+          
+          // Convert RGBA to CHW RGB Float32Array
+          const processedData = new Float32Array(640 * 640 * 3);
+          
+          // Convert from RGBA HWC to RGB CHW format
+          for (let c = 0; c < 3; c++) { // For each channel (R, G, B)
+            for (let h = 0; h < 640; h++) { // For each row
+              for (let w = 0; w < 640; w++) { // For each column
+                const rgbaIndex = (h * 640 + w) * 4 + c; // RGBA format index
+                const chwIndex = c * 640 * 640 + h * 640 + w; // CHW format index
+                processedData[chwIndex] = jimpData[rgbaIndex] / 255.0; // Normalize and skip alpha
+              }
+            }
+          }
+          
+          console.log('📊 Jimp converted to CHW format');
+          console.log('📊 Sample normalized values:', Array.from(processedData.slice(0, 10)));
+          
+          // Get input name
+          const inputNames = session.inputNames;
+          const inputName = inputNames && inputNames.length > 0 ? inputNames[0] : 'images';
+          
+          // Create tensor
+          const input = new ort.Tensor('float32', processedData, [1, 3, 640, 640]);
+          console.log('✅ Tensor created with Jimp data, running inference...');
+          
+          // Run inference
+          const feeds = {};
+          feeds[inputName] = input;
+          const results = await session.run(feeds);
+          
+          console.log('✅ Inference successful with Jimp data');
+          
+          // Get output
+          let output;
+          const possibleOutputNames = ['output', 'output0', 'output.0', 'predictions'];
+          
+          for (const name of possibleOutputNames) {
+            if (results[name]) {
+              output = results[name];
+              break;
+            }
+          }
+          
+          if (!output) {
+            const outputKeys = Object.keys(results);
+            if (outputKeys.length > 0) {
+              output = results[outputKeys[0]];
+            }
+          }
+          
+          return output ? parseDetections(output.data, width, height) : [];
+          
+        } catch (jimpError) {
+          console.log('❌ Jimp also failed:', jimpError.message);
+          return [];
+        }
       }
-      
-      // Normal Sharp processing
-      const processedData = new Float32Array(data.length);
-      for (let i = 0; i < data.length; i++) {
-        processedData[i] = data[i] / 255.0;
-      }
-      
-      console.log('📊 Normalized sample:', Array.from(processedData.slice(0, 10)));
-      
-      // Create tensor with float32
-      const input = new ort.Tensor('float32', processedData, [1, 3, 640, 640]);
-      const results = await session.run({ images: input });
-      console.log('✅ Inference successful with Sharp data');
-      
-      return parseDetections(results.output0.data, width, height);
     }
     
     return [];
@@ -172,54 +280,105 @@ async function processImage(imageData, width, height) {
   }
 }
 
-// Also update your parseDetections function for YOLOv5s (it might have different output format):
+// Also update parseDetections function to handle different YOLOv5s output formats
 function parseDetections(output, originalWidth, originalHeight) {
   const detections = [];
   console.log('📊 Raw output length:', output.length);
   
-  // YOLOv5s output format: [batch, detections, 85]
-  // where 85 = [x, y, w, h, confidence, ...80 class scores]
-  const numDetections = output.length / 85;
-  console.log('📊 Number of potential detections:', numDetections);
+  // YOLOv5s can have different output formats
+  // Common format: [batch, detections, attributes] where attributes = 85 (x,y,w,h,conf + 80 classes)
+  // Or: [batch, attributes, detections]
+  
+  let numDetections, attributesPerDetection;
+  
+  // Try to determine the format
+  if (output.length === 25200 * 85) {
+    // Format: [1, 25200, 85] - flattened
+    numDetections = 25200;
+    attributesPerDetection = 85;
+    console.log('📊 Detected format: [1, 25200, 85]');
+  } else if (output.length === 85 * 25200) {
+    // Format: [1, 85, 25200] - flattened
+    numDetections = 25200;
+    attributesPerDetection = 85;
+    console.log('📊 Detected format: [1, 85, 25200] - need to transpose');
+    
+    // Transpose the data
+    const transposed = new Float32Array(output.length);
+    for (let i = 0; i < numDetections; i++) {
+      for (let j = 0; j < attributesPerDetection; j++) {
+        transposed[i * attributesPerDetection + j] = output[j * numDetections + i];
+      }
+    }
+    output = transposed;
+  } else {
+    // Try to infer from total length
+    const totalElements = output.length;
+    if (totalElements % 85 === 0) {
+      numDetections = totalElements / 85;
+      attributesPerDetection = 85;
+      console.log(`📊 Inferred format: [${numDetections}, 85]`);
+    } else {
+      console.log('❌ Unknown output format, length:', totalElements);
+      return [];
+    }
+  }
+  
+  console.log(`📊 Processing ${numDetections} detections with ${attributesPerDetection} attributes each`);
+  
+  let validDetections = 0;
   
   for (let i = 0; i < numDetections; i++) {
-    const offset = i * 85;
-    const confidence = output[offset + 4];
+    const offset = i * attributesPerDetection;
     
-    if (confidence > 0.25) {  // Lower threshold for testing
-      const x = output[offset];
-      const y = output[offset + 1];
-      const w = output[offset + 2];
-      const h = output[offset + 3];
-      
+    // Get bbox coordinates and confidence
+    const x = output[offset];     // center x
+    const y = output[offset + 1]; // center y
+    const w = output[offset + 2]; // width
+    const h = output[offset + 3]; // height
+    const confidence = output[offset + 4]; // objectness score
+    
+    if (confidence > 0.25) { // Lower threshold for testing
       // Find best class
       let bestClass = 0;
       let bestScore = 0;
+      
       for (let j = 0; j < 80; j++) {
-        const score = output[offset + 5 + j];
-        if (score > bestScore) {
-          bestScore = score;
+        const classScore = output[offset + 5 + j];
+        if (classScore > bestScore) {
+          bestScore = classScore;
           bestClass = j;
         }
       }
       
       const finalScore = confidence * bestScore;
-      console.log(`📊 Detection ${i}: class=${bestClass}, confidence=${confidence.toFixed(3)}, finalScore=${finalScore.toFixed(3)}`);
       
-      if (finalScore > 0.25) {  // Lower threshold for testing
+      if (finalScore > 0.25) { // Lower threshold for testing
+        validDetections++;
+        
+        // Convert from center coordinates to corner coordinates
+        const xmin = Math.max(0, (x - w/2) / 640);
+        const ymin = Math.max(0, (y - h/2) / 640);
+        const xmax = Math.min(1, (x + w/2) / 640);
+        const ymax = Math.min(1, (y + h/2) / 640);
+        
         detections.push({
           label: classNames[bestClass] || 'unknown',
           score: finalScore,
-          xmin: Math.max(0, (x - w/2) / 640),
-          ymin: Math.max(0, (y - h/2) / 640),
-          xmax: Math.min(1, (x + w/2) / 640),
-          ymax: Math.min(1, (y + h/2) / 640)
+          xmin: xmin,
+          ymin: ymin,
+          xmax: xmax,
+          ymax: ymax
         });
+        
+        if (validDetections <= 5) { // Log first few detections
+          console.log(`📊 Detection ${validDetections}: ${classNames[bestClass]} (${(finalScore * 100).toFixed(1)}%) at [${xmin.toFixed(3)}, ${ymin.toFixed(3)}, ${xmax.toFixed(3)}, ${ymax.toFixed(3)}]`);
+        }
       }
     }
   }
   
-  console.log(`✅ Found ${detections.length} valid detections`);
+  console.log(`✅ Found ${validDetections} valid detections out of ${numDetections} candidates`);
   return detections;
 }
 
