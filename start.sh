@@ -7,61 +7,68 @@ HTTPS_PORT=${HTTPS_PORT:-8443}
 
 echo "🚀 Starting WebRTC Object Detection Demo"
 echo "Mode: $MODE"
-echo "Port: $PORT"
 
 # Create models directory
 mkdir -p models
 
-# Check if we have the YOLOv5s model (14MB), if not download it
+# Check for YOLOv5s model and download if missing
 if [ ! -f "models/yolov5s.onnx" ]; then
-    echo "📥 Downloading YOLOv5s model..."
-    echo "📥 Downloading YOLOv5s ONNX model (14MB)..."
-    echo "📍 From: https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx"
-    echo "💾 To: $(pwd)/models/yolov5s.onnx"
+    echo "📥 Downloading YOLOv5s model (compatible float32 version)..."
     
-    # Try wget first, then curl
+    # Try multiple reliable sources
     if command -v wget >/dev/null 2>&1; then
-        if wget --progress=bar:force:noscroll -O models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx" 2>&1 | \
-           while IFS= read -r line; do
-               if [[ $line =~ ([0-9]+)%.*\[.*\].*([0-9]+[KMG]?).*([0-9]+[KMG]?) ]]; then
-                   printf "\r⏳ Progress: %s (%s / %s)" "${BASH_REMATCH[1]}%" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
-               fi
-           done; then
-            echo ""
-            echo "✅ Model downloaded successfully!"
-        else
-            echo "❌ wget failed, trying curl..."
-            curl -L --progress-bar -o models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx"
-        fi
+        echo "Trying source 1..."
+        wget -O models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v6.0/yolov5s.onnx" || \
+        echo "Source 1 failed, trying source 2..." && \
+        wget -O models/yolov5s.onnx "https://huggingface.co/ultralytics/yolov5/resolve/main/yolov5s.onnx" || \
+        echo "Source 2 failed, trying source 3..." && \
+        wget -O models/yolov5s.onnx "https://github.com/onnx/models/raw/main/validated/vision/object_detection_segmentation/yolov5/model/yolov5s.onnx"
+    elif command -v curl >/dev/null 2>&1; then
+        echo "Trying source 1..."
+        curl -L -o models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v6.0/yolov5s.onnx" || \
+        echo "Source 1 failed, trying source 2..." && \
+        curl -L -o models/yolov5s.onnx "https://huggingface.co/ultralytics/yolov5/resolve/main/yolov5s.onnx" || \
+        echo "Source 2 failed, trying source 3..." && \
+        curl -L -o models/yolov5s.onnx "https://github.com/onnx/models/raw/main/validated/vision/object_detection_segmentation/yolov5/model/yolov5s.onnx"
     else
-        curl -L --progress-bar -o models/yolov5s.onnx "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx"
+        echo "❌ Neither wget nor curl found. Please install one of them."
+        exit 1
     fi
     
-    # Check download success
     if [ -f "models/yolov5s.onnx" ]; then
-        size=$(stat -f%z models/yolov5s.onnx 2>/dev/null || stat -c%s models/yolov5s.onnx 2>/dev/null || echo "unknown")
-        size_mb=$((size / 1024 / 1024))
-        echo "📊 File size: ${size_mb}MB"
-        
-        if [ $size_mb -gt 10 ]; then
-            echo "✅ Model size looks correct!"
+        echo "✅ Model downloaded successfully!"
+        # Verify it's a valid ONNX file
+        if file models/yolov5s.onnx | grep -q "data"; then
+            echo "✅ Model appears to be valid"
         else
-            echo "⚠️ Warning: Model size seems small (${size_mb}MB), expected ~14MB"
+            echo "⚠️  Model file may be corrupted"
         fi
     else
-        echo "❌ Failed to download model"
+        echo "❌ All download attempts failed"
+        echo "Please manually download yolov5s.onnx (v6.0) and place it in the models/ folder"
+        echo "You can get it from: https://github.com/ultralytics/yolov5/releases/download/v6.0/yolov5s.onnx"
         exit 1
     fi
 else
-    size=$(stat -f%z models/yolov5s.onnx 2>/dev/null || stat -c%s models/yolov5s.onnx 2>/dev/null || echo "unknown")
-    size_mb=$((size / 1024 / 1024))
-    echo "✅ YOLOv5s model found (${size_mb}MB)"
+    echo "✅ YOLOv5s model found"
+    # Check if the existing model is valid
+    if ! file models/yolov5s.onnx | grep -q "data"; then
+        echo "❌ Existing model appears corrupted, removing and re-downloading..."
+        rm models/yolov5s.onnx
+        exit 1
+    fi
 fi
 
-# Remove old yolov5n model if it exists to avoid confusion
-if [ -f "models/yolov5n.onnx" ]; then
-    echo "🗑️ Removing old YOLOv5n model..."
-    rm models/yolov5n.onnx
+# Generate SSL certificates if they don't exist (for HTTPS/WebRTC)
+if [ ! -f "key.pem" ] || [ ! -f "cert.pem" ]; then
+    echo "🔒 Generating SSL certificates for HTTPS..."
+    if command -v openssl >/dev/null 2>&1; then
+        openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
+            -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" >/dev/null 2>&1
+        echo "✅ SSL certificates generated"
+    else
+        echo "⚠️  OpenSSL not found - will use HTTP (camera may not work on mobile)"
+    fi
 fi
 
 echo "🎬 Starting server..."
@@ -74,24 +81,16 @@ else
     echo "🖥️  Running in server mode (server-side inference)"
 fi
 
-# Generate SSL certificates if they don't exist
-if [ ! -f "key.pem" ] || [ ! -f "cert.pem" ]; then
-    echo "🔐 Generating SSL certificates for HTTPS..."
-    openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
-        -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" >/dev/null 2>&1
-fi
-
-echo "🔒 Starting HTTPS server for WebRTC compatibility..."
-
 # Set environment variables and start server
 export MODE=$MODE
 export PORT=$PORT
 export HTTPS_PORT=$HTTPS_PORT
 
-# Start with node
+# Check if Node.js is available
 if command -v node >/dev/null 2>&1; then
     node server.js
 else
     echo "❌ Node.js not found. Please install Node.js first."
+    echo "Visit: https://nodejs.org/"
     exit 1
 fi
